@@ -20,7 +20,7 @@ import numpy as np
 
 try:
     import cantera as ct
-    from cantera import ck2cti
+    from cantera import ck2yaml
 except ImportError:
     print('Error: Cantera must be installed.')
     raise
@@ -137,14 +137,14 @@ class ReactorConstVol(object):
 def convert_mech(mech_filename, therm_filename=None):
     """Convert a mechanism and return a string with the filename.
 
-    Convert a CHEMKIN format mechanism to the Cantera CTI format using
-    the Cantera built-in script ``ck2cti``.
+    Convert a CHEMKIN format mechanism to the Cantera YAML format using
+    the Cantera built-in script ``ck2yaml``.
 
     Parameters
     ----------
     mech_filename : str
         Filename of the input CHEMKIN format mechanism. The converted
-        CTI file will have the same name, but with ``.cti`` extension.
+        YAML file will have the same name, but with ``.yaml`` extension.
     thermo_filename : str
         Filename of the thermodynamic database. Optional, if the
         thermodynamic database is present in the mechanism input.
@@ -152,7 +152,7 @@ def convert_mech(mech_filename, therm_filename=None):
     Returns
     -------
     mech_filename : str
-        Filename of converted mechanism in Cantera ``.cti`` format.
+        Filename of converted mechanism in Cantera ``.yaml`` format.
 
     """
 
@@ -162,8 +162,8 @@ def convert_mech(mech_filename, therm_filename=None):
     arg.append('--permissive')
 
     # Convert the mechanism
-    ck2cti.main(arg)
-    mech_filename = mech_filename[:-4] + '.cti'
+    ck2yaml.main(arg)
+    mech_filename = mech_filename[:-4] + '.yaml'
     print('Mechanism conversion successful, written to '
           '{}'.format(mech_filename)
           )
@@ -229,10 +229,7 @@ def is_pdep(rxn):
     -------
     ``True`` if third-body, falloff, or chemically activated reaction.
     """
-    return (isinstance(rxn, ct.ThreeBodyReaction) or
-            isinstance(rxn, ct.FalloffReaction) or
-            isinstance(rxn, ct.ChemicallyActivatedReaction)
-            )
+    return rxn.third_body is not None
 
 
 def run_pasr(pasr_input_file, mech_filename, pasr_output_file=None):
@@ -1123,7 +1120,7 @@ def test(lang, home_dir, build_dir, mech_filename, therm_filename=None,
     # Interpret reaction mechanism file, depending on Cantera or
     # Chemkin format.
     ck_mech_filename = None
-    if not mech_filename.endswith(tuple(['.cti', '.xml'])):
+    if not mech_filename.endswith(tuple(['.yaml', '.yml'])):
         # Chemkin format; need to convert first.
         ck_mech_filename = mech_filename
         mech_filename = convert_mech(mech_filename, therm_filename)
@@ -1202,15 +1199,13 @@ def test(lang, home_dir, build_dir, mech_filename, therm_filename=None,
     # modification
     idx_rev_pmod = [
                 i for i, idx in enumerate(idx_rev) if
-                isinstance(gas.reaction(idx), ct.ThreeBodyReaction) or
-                isinstance(gas.reaction(idx), ct.FalloffReaction) or
-                isinstance(gas.reaction(idx), ct.ChemicallyActivatedReaction)
+                gas.reaction(idx).third_body is not None
                 ]
 
     # Check mechanism for Plog or Chebyshev reactions... if any, can't
     # compare Jacobian to TChem
-    if any([isinstance(rxn, ct.PlogReaction) or
-            isinstance(rxn, ct.ChebyshevReaction) for rxn in gas.reactions()
+    if any([isinstance(rxn.rate, ct.PlogRate) or
+            isinstance(rxn.rate, ct.ChebyshevRate) for rxn in gas.reactions()
             ]):
         print('TChem comparison disabled; '
               'not compatible with Plog or Chebyshev reactions.'

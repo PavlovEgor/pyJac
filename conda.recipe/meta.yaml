@@ -13,7 +13,7 @@ build:
 
 requirements:
   build:
-    - python >=2.7,<3|>=3.5,{{PY_VER}}*
+    - python >=3.5,{{PY_VER}}*
     - setuptools
 
   run:
@@ -23,7 +23,7 @@ requirements:
     - bitarray >=0.8.1
     - cython >=0.23.1
     - optionloop >1.0.3
-    - cantera >=2.3.0
+    - cantera >=3.0
 
 test:
   imports:

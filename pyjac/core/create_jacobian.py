@@ -2260,6 +2260,11 @@ def write_jacobian(path, lang, specs, reacs, seen_sp, smm=None):
             pdep_reacs.append(i)
     num_pdep = len(pdep_reacs)
 
+    # reaction index -> position within rev_reacs/pdep_reacs, so repeated
+    # lookups below don't rescan these lists for every reaction
+    rev_reacs_pos = {ind: pos for pos, ind in enumerate(rev_reacs)}
+    pdep_reacs_pos = {ind: pos for pos, ind in enumerate(pdep_reacs)}
+
     # create file depending on language
     filename = 'jacob' + utils.file_ext[lang]
     file = open(os.path.join(path, filename), 'w')
@@ -2731,7 +2736,7 @@ def write_jacobian(path, lang, specs, reacs, seen_sp, smm=None):
             jline = ''
             pres_rxn_ind = None
             if rxn.pdep:
-                pres_rxn_ind = pdep_reacs.index(rxn_ind)
+                pres_rxn_ind = pdep_reacs_pos[rxn_ind]
                 last_conc_temp = write_pr(file, lang, specs, reacs, pdep_reacs,
                                           rxn, get_array, last_conc_temp
                                           )
@@ -2746,7 +2751,7 @@ def write_jacobian(path, lang, specs, reacs, seen_sp, smm=None):
 
             elif rxn.thd_body:
                 # third body reaction
-                pres_rxn_ind = pdep_reacs.index(rxn_ind)
+                pres_rxn_ind = pdep_reacs_pos[rxn_ind]
 
                 jline = (utils.line_start +
                          'j_temp = ((-' +
@@ -2758,7 +2763,7 @@ def write_jacobian(path, lang, specs, reacs, seen_sp, smm=None):
                     # forward and reverse reaction rates
                     jline += '(' + get_array(lang, 'fwd_rates', rxn_ind)
                     jline += ' - ' + \
-                        get_array(lang, 'rev_rates', rev_reacs.index(rxn_ind))
+                        get_array(lang, 'rev_rates', rev_reacs_pos[rxn_ind])
                     jline += ')'
                 else:
                     # forward reaction rate only
@@ -2777,20 +2782,20 @@ def write_jacobian(path, lang, specs, reacs, seen_sp, smm=None):
             doT = True
             if rxn.plog:
                 write_plog_rxn_dt(file, lang, jline, specs, rxn, rxn_ind,
-                                  rev_reacs.index(rxn_ind) if rxn.rev else None,
+                                  rev_reacs_pos[rxn_ind] if rxn.rev else None,
                                   get_array, do_unroll
                                   )
 
             elif rxn.cheb:
                 write_cheb_rxn_dt(file, lang, jline, rxn, rxn_ind,
-                                  rev_reacs.index(rxn_ind) if rxn.rev else None,
+                                  rev_reacs_pos[rxn_ind] if rxn.rev else None,
                                   specs, get_array, do_unroll
                                   )
 
             else:
                 dkdt = get_elementary_rxn_dt(
                     lang, specs, rxn, rxn_ind,
-                    rev_reacs.index(rxn_ind) if rxn.rev else None,
+                    rev_reacs_pos[rxn_ind] if rxn.rev else None,
                     get_array, do_unroll
                     )
                 if dkdt:
@@ -3036,7 +3041,7 @@ def write_jacobian(path, lang, specs, reacs, seen_sp, smm=None):
 
     line = utils.line_start + 'cp_avg = '
     isfirst = True
-    for sp in specs[:-1]:
+    for isp, sp in enumerate(specs[:-1]):
         if len(line) > 70:
             if lang in ['c', 'cuda']:
                 line += '\n'
@@ -3047,7 +3052,6 @@ def write_jacobian(path, lang, specs, reacs, seen_sp, smm=None):
             file.write(line)
             line = utils.line_start + '   '
 
-        isp = specs.index(sp)
         line += ('(' + get_array(lang, 'y', isp + 1) +
                  ' * ' + get_array(lang, 'cp', isp) + ')'
                  ' + '
@@ -3487,7 +3491,7 @@ def create_jacobian(lang, mech_name=None, therm_name=None, gas=None, optimize_ca
 
     # Interpret reaction mechanism file, depending on Cantera or
     # Chemkin format.
-    if gas is not None or mech_name.endswith(tuple(['.cti', '.xml'])):
+    if gas is not None or mech_name.endswith(tuple(['.yaml', '.yml'])):
         elems, specs, reacs = mech.read_mech_ct(mech_name, gas)
     else:
         elems, specs, reacs = mech.read_mech(mech_name, therm_name)

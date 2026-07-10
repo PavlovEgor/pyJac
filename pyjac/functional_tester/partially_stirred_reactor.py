@@ -23,7 +23,6 @@ except ImportError:
     raise
 try:
     import cantera as ct
-    from cantera import ck2cti
 except ImportError:
     print('Error: Cantera must be installed.')
     raise

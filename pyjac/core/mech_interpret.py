@@ -22,9 +22,11 @@ from . import chem_utilities as chem
 CANTERA_FLAG = False
 try:
     import cantera as ct
-    version = ct.__version__.split('.')
-    if int(version[0]) < 2 or int(version[1]) < 3:
-        print('Parsing of Cantera mechanisms requires at least version 2.3.0 in order to access species thermo properties...')
+    version = tuple(int(x) for x in ct.__version__.split('.')[:2])
+    if version < (3, 0):
+        print('Parsing of Cantera mechanisms requires at least version 3.0.0, '
+              'which introduced the unified Reaction/ReactionRate API pyJac '
+              'relies on.')
         print('Detected version is only {}'.format(ct.__version__))
         sys.exit(1)
     CANTERA_FLAG = True
@@ -83,6 +85,7 @@ def read_mech(mech_filename, therm_filename):
     elems = []
     reacs = []
     specs = []
+    spec_names = set()
     key = ''
 
     with open(mech_filename, 'r') as file:
@@ -187,7 +190,8 @@ def read_mech(mech_filename, therm_filename):
                 line_split = line.split()
                 for s in line_split:
                     if s[0:3] == 'end': continue
-                    if not next((sp for sp in specs if sp.name == s), None):
+                    if s not in spec_names:
+                        spec_names.add(s)
                         specs.append(chem.SpecInfo(s))
 
             elif key == 'reac':
@@ -754,6 +758,11 @@ def read_thermo(filename, elems, specs):
 
     """
 
+    # name -> SpecInfo lookup, and count of species still missing thermo data,
+    # so the per-line matching below doesn't rescan the whole species list
+    spec_by_name = {sp.name: sp for sp in specs}
+    remaining = sum(1 for sp in specs if not sp.mw)
+
     with open(filename, 'r') as file:
 
         # loop through intro lines
@@ -801,11 +810,8 @@ def read_thermo(filename, elems, specs):
                 spec = spec[0: spec.find(' ')]
 
             # now need to determine if this species is in mechanism
-            if next((sp for sp in specs if sp.name == spec), None):
-                sp_ind = next(i for i in range(len(specs))
-                              if specs[i].name == spec
-                              )
-            else:
+            spec_obj = spec_by_name.get(spec)
+            if spec_obj is None:
                 # not in mechanism, read next three lines and continue
                 line = file.readline()
                 line = file.readline()
@@ -813,7 +819,7 @@ def read_thermo(filename, elems, specs):
                 continue
 
             # set species to the one matched
-            spec = specs[sp_ind]
+            spec = spec_obj
 
             # ensure not reading the same species more than once...
             if spec.mw:
@@ -878,7 +884,8 @@ def read_thermo(filename, elems, specs):
             spec.lo[6] = float(coeffs[3])
 
             # stop reading if all species in mechanism accounted for
-            if not next((sp for sp in specs if sp.mw == 0.0), None): break
+            remaining -= 1
+            if remaining <= 0: break
 
     return None
 
@@ -889,7 +896,7 @@ def read_mech_ct(filename=None, gas=None):
     Parameters
     ----------
     filename : str
-        Reaction mechanism filename (e.g. 'mech.cti'). Optional.
+        Reaction mechanism filename (e.g. 'mech.yaml'). Optional.
     gas : `cantera.Solution` object
         Existing Cantera Solution object to be used. Optional.
 
@@ -957,16 +964,16 @@ def read_mech_ct(filename=None, gas=None):
     # Cantera internally uses joules/kmol for activation energy
     E_fac = act_energy_fact['joules/kmole']
 
-    def handle_effiencies(reac, ct_rxn):
-        """Convert Cantera `cantera.Reaction`'s third body efficienicies
+    def handle_effiencies(reac, third_body):
+        """Convert a Cantera `cantera.ThirdBody`'s collision efficiencies
            to pyJac's internal format, and return updated reaction
 
         Parameters
         ----------
         reac : `ReacInfo`
             The pyJac reaction to update
-        ct_rxn : `Reaction` object
-            Corresponding cantera reaction to pull the third bodies from
+        third_body : `cantera.ThirdBody`
+            The reaction's third-body collider information (``rxn.third_body``)
 
         Returns
         -------
@@ -974,108 +981,118 @@ def read_mech_ct(filename=None, gas=None):
             The updated pyjac reaction with appropriate third body efficiencies
         """
 
-        # See if single species acts as third body
-        if rxn.default_efficiency == 0.0 \
-                and len(ct_rxn.efficiencies.keys()) == 1\
-                and list(ct_rxn.efficiencies.values())[0] == 1\
-                and reac.pdep:
-            reac.pdep_sp = list(rxn.efficiencies.keys())[0]
+        # A named collider other than the generic 'M' means this (pressure-
+        # dependent) reaction's rate depends on the concentration of exactly
+        # one species; Cantera guarantees default_efficiency == 0 and
+        # efficiencies == {name: 1} in that case.
+        if reac.pdep and third_body.name != 'M':
+            reac.pdep_sp = third_body.name
         else:
             for sp in gas.species_names:
-                if sp in ct_rxn.efficiencies:
-                    reac.thd_body_eff.append([sp, ct_rxn.efficiencies[sp]])
-                elif ct_rxn.default_efficiency != 1.0:
-                    reac.thd_body_eff.append([sp, ct_rxn.default_efficiency])
+                if sp in third_body.efficiencies:
+                    reac.thd_body_eff.append([sp, third_body.efficiencies[sp]])
+                elif third_body.default_efficiency != 1.0:
+                    reac.thd_body_eff.append([sp, third_body.default_efficiency])
+        return reac
+
+    def set_falloff_form(reac, rate):
+        """Extract Troe/SRI falloff parameters (if any) from a Cantera
+           `cantera.FalloffRate` and store them on the pyJac reaction,
+           working around zero Troe parameters that would cause a division
+           by zero in the generated code.
+
+        Parameters
+        ----------
+        reac : `ReacInfo`
+            The pyJac reaction to update
+        rate : `cantera.FalloffRate`
+            The falloff rate expression (``rxn.rate``) to pull parameters from
+
+        Returns
+        -------
+        updated_reac: `ReacInfo`
+            The updated pyjac reaction with appropriate falloff parameters
+        """
+
+        if isinstance(rate, ct.TroeRate):
+            reac.troe = True
+            reac.troe_par = rate.falloff_coeffs.tolist()
+            do_warn = False
+            if reac.troe_par[1] == 0:
+                reac.troe_par[1] = 1e-30
+                do_warn = True
+            if reac.troe_par[2] == 0:
+                reac.troe_par[2] = 1e-30
+                do_warn = True
+            if do_warn:
+                logging.warn('Troe parameters in reaction {} modified to avoid'
+                             ' division by zero!.'.format(len(reacs)))
+        elif isinstance(rate, ct.SriRate):
+            reac.sri = True
+            reac.sri_par = rate.falloff_coeffs.tolist()
         return reac
 
     for rxn in gas.reactions():
 
-        if isinstance(rxn, ct.ThreeBodyReaction):
+        rate = rxn.rate
+        third_body = rxn.third_body
+
+        if isinstance(rate, ct.ArrheniusRate) and third_body is not None:
+            # Plain third-body reaction (no pressure-dependent falloff).
             # Instantiate internal reaction based on Cantera Reaction data.
             reac = chem.ReacInfo(rxn.reversible,
                                  list(rxn.reactants.keys()),
                                  list(rxn.reactants.values()),
                                  list(rxn.products.keys()),
                                  list(rxn.products.values()),
-                                 rxn.rate.pre_exponential_factor,
-                                 rxn.rate.temperature_exponent,
-                                 rxn.rate.activation_energy * E_fac
+                                 rate.pre_exponential_factor,
+                                 rate.temperature_exponent,
+                                 rate.activation_energy * E_fac
                                  )
             reac.thd_body = True
-            reac = handle_effiencies(reac, rxn)
+            reac = handle_effiencies(reac, third_body)
 
-        elif isinstance(rxn, ct.FalloffReaction) and \
-             not isinstance(rxn, ct.ChemicallyActivatedReaction):
+        elif isinstance(rate, ct.FalloffRate) and not rate.chemically_activated:
             reac = chem.ReacInfo(rxn.reversible,
                                  list(rxn.reactants.keys()),
                                  list(rxn.reactants.values()),
                                  list(rxn.products.keys()),
                                  list(rxn.products.values()),
-                                 rxn.high_rate.pre_exponential_factor,
-                                 rxn.high_rate.temperature_exponent,
-                                 rxn.high_rate.activation_energy * E_fac
+                                 rate.high_rate.pre_exponential_factor,
+                                 rate.high_rate.temperature_exponent,
+                                 rate.high_rate.activation_energy * E_fac
                                  )
             reac.pdep = True
-            reac = handle_effiencies(reac, rxn)
+            reac = handle_effiencies(reac, third_body)
 
-            reac.low = [rxn.low_rate.pre_exponential_factor,
-                        rxn.low_rate.temperature_exponent,
-                        rxn.low_rate.activation_energy * E_fac
+            reac.low = [rate.low_rate.pre_exponential_factor,
+                        rate.low_rate.temperature_exponent,
+                        rate.low_rate.activation_energy * E_fac
                         ]
 
-            if rxn.falloff.type == 'Troe':
-                reac.troe = True
-                reac.troe_par = rxn.falloff.parameters.tolist()
-                do_warn = False
-                if reac.troe_par[1] == 0:
-                    reac.troe_par[1] = 1e-30
-                    do_warn = True
-                if reac.troe_par[2] == 0:
-                    reac.troe_par[2] = 1e-30
-                    do_warn = True
-                if do_warn:
-                    logging.warn('Troe parameters in reaction {} modified to avoid'
-                                 ' division by zero!.'.format(len(reacs)))
-            elif rxn.falloff.type == 'SRI':
-                reac.sri = True
-                reac.sri_par = rxn.falloff.parameters.tolist()
+            reac = set_falloff_form(reac, rate)
 
-        elif isinstance(rxn, ct.ChemicallyActivatedReaction):
+        elif isinstance(rate, ct.FalloffRate) and rate.chemically_activated:
             reac = chem.ReacInfo(rxn.reversible,
                                  list(rxn.reactants.keys()),
                                  list(rxn.reactants.values()),
                                  list(rxn.products.keys()),
                                  list(rxn.products.values()),
-                                 rxn.low_rate.pre_exponential_factor,
-                                 rxn.low_rate.temperature_exponent,
-                                 rxn.low_rate.activation_energy * E_fac
+                                 rate.low_rate.pre_exponential_factor,
+                                 rate.low_rate.temperature_exponent,
+                                 rate.low_rate.activation_energy * E_fac
                                  )
             reac.pdep = True
-            reac = handle_effiencies(reac, rxn)
+            reac = handle_effiencies(reac, third_body)
 
-            reac.high = [rxn.high_rate.pre_exponential_factor,
-                         rxn.high_rate.temperature_exponent,
-                         rxn.high_rate.activation_energy * E_fac
+            reac.high = [rate.high_rate.pre_exponential_factor,
+                         rate.high_rate.temperature_exponent,
+                         rate.high_rate.activation_energy * E_fac
                          ]
 
-            if rxn.falloff.type == 'Troe':
-                reac.troe = True
-                reac.troe_par = rxn.falloff.parameters.tolist()
-                do_warn = False
-                if reac.troe_par[1] == 0:
-                    reac.troe_par[1] = 1e-30
-                    do_warn = True
-                if reac.troe_par[2] == 0:
-                    reac.troe_par[2] = 1e-30
-                    do_warn = True
-                if do_warn:
-                    logging.warn('Troe parameters in reaction {} modified to avoid'
-                                    ' division by zero!.'.format(len(reacs)))
-            elif rxn.falloff.type == 'SRI':
-                reac.sri = True
-                reac.sri_par = rxn.falloff.parameters.tolist()
+            reac = set_falloff_form(reac, rate)
 
-        elif isinstance(rxn, ct.PlogReaction):
+        elif isinstance(rate, ct.PlogRate):
             reac = chem.ReacInfo(rxn.reversible,
                                  list(rxn.reactants.keys()),
                                  list(rxn.reactants.values()),
@@ -1085,14 +1102,14 @@ def read_mech_ct(filename=None, gas=None):
                                  )
             reac.plog = True
             reac.plog_par = []
-            for rate in rxn.rates:
-                pars = [rate[0], rate[1].pre_exponential_factor,
-                        rate[1].temperature_exponent,
-                        rate[1].activation_energy * E_fac
+            for pressure, arrhenius in rate.rates:
+                pars = [pressure, arrhenius.pre_exponential_factor,
+                        arrhenius.temperature_exponent,
+                        arrhenius.activation_energy * E_fac
                         ]
                 reac.plog_par.append(pars)
 
-        elif isinstance(rxn, ct.ChebyshevReaction):
+        elif isinstance(rate, ct.ChebyshevRate):
             reac = chem.ReacInfo(rxn.reversible,
                                  list(rxn.reactants.keys()),
                                  list(rxn.reactants.values()),
@@ -1101,17 +1118,18 @@ def read_mech_ct(filename=None, gas=None):
                                  0.0, 0.0, 0.0
                                  )
             reac.cheb = True
-            reac.cheb_n_temp = rxn.nTemperature
-            reac.cheb_n_pres = rxn.nPressure
-            reac.cheb_plim = [rxn.Pmin, rxn.Pmax]
-            reac.cheb_tlim = [rxn.Tmin, rxn.Tmax]
-            reac.cheb_par = rxn.coeffs
+            reac.cheb_n_temp = rate.n_temperature
+            reac.cheb_n_pres = rate.n_pressure
+            reac.cheb_plim = list(rate.pressure_range)
+            reac.cheb_tlim = list(rate.temperature_range)
+            reac.cheb_par = rate.data
 
-        elif isinstance(rxn, ct.ElementaryReaction):
+        elif isinstance(rate, ct.ArrheniusRate):
+            # Plain elementary reaction (no third body).
             # Instantiate internal reaction based on Cantera Reaction data.
 
             # Ensure no reactions with zero pre-exponential factor allowed
-            if rxn.rate.pre_exponential_factor == 0.0:
+            if rate.pre_exponential_factor == 0.0:
                 continue
 
             reac = chem.ReacInfo(rxn.reversible,
@@ -1119,9 +1137,9 @@ def read_mech_ct(filename=None, gas=None):
                                  list(rxn.reactants.values()),
                                  list(rxn.products.keys()),
                                  list(rxn.products.values()),
-                                 rxn.rate.pre_exponential_factor,
-                                 rxn.rate.temperature_exponent,
-                                 rxn.rate.activation_energy * E_fac
+                                 rate.pre_exponential_factor,
+                                 rate.temperature_exponent,
+                                 rate.activation_energy * E_fac
                                  )
 
         else:

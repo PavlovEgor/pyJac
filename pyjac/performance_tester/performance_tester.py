@@ -22,7 +22,6 @@ import numpy as np
 
 try:
     import cantera as ct
-    from cantera import ck2cti
 except ImportError:
     print('Error: Cantera must be installed.')
     raise
@@ -62,10 +61,7 @@ def is_pdep(rxn):
     ``True`` if `rxn` is pressure dependent
 
     """
-    return (isinstance(rxn, ct.ThreeBodyReaction) or
-            isinstance(rxn, ct.FalloffReaction) or
-            isinstance(rxn, ct.ChemicallyActivatedReaction)
-            )
+    return rxn.third_body is not None
 
 
 def check_step_file(filename, steplist):
@@ -244,10 +240,10 @@ def performance_tester(home, work_dir, use_old_opt):
             files = [f for f in os.listdir(os.path.join(work_dir, name)) if
                         os.path.isfile(os.path.join(work_dir, name, f))]
             for f in files:
-                if f.endswith('.cti'):
+                if f.endswith('.yaml'):
                     mechanism_list[name] = {}
                     mechanism_list[name]['mech'] = f
-                    mechanism_list[name]['chemkin'] = f.replace('.cti', '.dat')
+                    mechanism_list[name]['chemkin'] = f.replace('.yaml', '.dat')
                     gas = ct.Solution(os.path.join(work_dir, name, f))
                     mechanism_list[name]['ns'] = gas.n_species
 
@@ -377,8 +373,8 @@ def performance_tester(home, work_dir, use_old_opt):
                 num_threads = state['num_threads']
 
 
-            if any([isinstance(rxn, ct.PlogReaction) or
-                isinstance(rxn, ct.ChebyshevReaction) for rxn in gas.reactions()
+            if any([isinstance(rxn.rate, ct.PlogRate) or
+                isinstance(rxn.rate, ct.ChebyshevRate) for rxn in gas.reactions()
                 ]) and lang == 'tchem':
                 print('TChem performance evaluation disabled; '
                       'not compatible with Plog or Chebyshev reactions.'
