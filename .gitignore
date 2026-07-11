@@ -74,3 +74,6 @@ Figures/
 # generated wrappers
 pyjacob_wrapper.c
 pytchem_wrapper.c
+
+#venv
+pyjacvenv/
