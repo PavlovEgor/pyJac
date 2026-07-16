@@ -437,7 +437,7 @@ void eval_jacob(const double t, const double p, const double* y,
             file.write('#endif\n')
 
 
-def write_header(path, lang):
+def write_header(path, lang, conp=True):
     """Writes minimal header file used by all other source files.
 
     Parameters
@@ -446,6 +446,9 @@ def write_header(path, lang):
         Path where files are being written.
     lang : {'c', 'cuda', 'fortran', 'matlab'}
         Language type.
+    conp : bool, optional
+        If True, use constant-pressure formulation; if False, constant-volume.
+        Default is True.
 
     Returns
     -------
@@ -455,6 +458,9 @@ def write_header(path, lang):
     if lang in ['matlab', 'fortran']:
         raise NotImplementedError
 
+    conp_line = '#define CONP\n' if conp else '//#define CONP\n'
+    conv_line = '//#define CONV\n' if conp else '#define CONV\n'
+
     with open(os.path.join(path, 'header' + utils.header_ext[lang]), 'w') as file:
         file.write('#ifndef HEAD\n'
                    '#define HEAD\n'
@@ -462,8 +468,8 @@ def write_header(path, lang):
                    '#include <math.h>'
                    '\n'
                    '/** Constant pressure or volume. */\n'
-                   '#define CONP\n'
-                   '//#define CONV\n'
+                   + conp_line +
+                   conv_line +
                    '\n'
                    '/** Include mechanism header to get NSP and NN **/\n'
                    '#include "mechanism{}"\n'.format(utils.header_ext[lang]) +
