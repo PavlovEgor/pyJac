@@ -1754,8 +1754,18 @@ def write_plog_rxn_dt(file, lang, jline, specs, rxn, rxn_ind,
             # negative A's, so we need to handle the
             # log(K2) - log(K1) term differently
             raise NotImplementedError
+        elif b_p1 == 0.0 and E_p1 == 0.0 and b_p2 == 0.0 and E_p2 == 0.0:
+            # Both pressure-bracket endpoints use a purely constant
+            # (temperature-independent) rate expression, so the
+            # T-derivative contribution from the PLOG interpolation term
+            # itself is exactly zero. Emit an explicit "0.0e0)" (mirroring
+            # the empty-jline_p fallback used elsewhere in this function)
+            # rather than an empty string: the enclosing wrapper always
+            # supplies one extra unmatched '(' that this term must close,
+            # and a bare ')' with nothing before it would produce invalid
+            # empty parentheses "()" in the generated C/CUDA code.
+            jline_p = '0.0e0)'
         else:
-            assert b_p1 != 0.0 or E_p1 != 0.0 or b_p2 != 0.0 or E_p2 != 0.0, "PLOG Derivative undefined"
             if b_p1 != 0.0:
                 jline_p += '{:.16e}'.format(b_p1)
             if E_p1 != 0.0:
@@ -1766,14 +1776,21 @@ def write_plog_rxn_dt(file, lang, jline, specs, rxn, rxn_ind,
 
                 jline_p += '('
                 if b_p2 - b_p1 != 0.0:
-                    jline_p += '{:.16e} + '.format(b_p2 - b_p1)
+                    jline_p += '{:.16e}'.format(b_p2 - b_p1)
                 if E_p2 - E_p1 != 0.0:
-                    jline_p += '{:.16e} / T) * (log(pres)'.format(E_p2 - E_p1)
-                    if p1 != 1.0:
-                        jline_p += ' - {:.16e}'.format(math.log(p1))
-                    jline_p += ') / '
-                    assert p1 != p2, 'Cannot have equal pressures in PLOG'
-                    jline_p += '{:.16e})'.format(math.log(p2) - math.log(p1))
+                    if b_p2 - b_p1 != 0.0:
+                        jline_p += ' + '
+                    jline_p += '{:.16e} / T'.format(E_p2 - E_p1)
+                # Close the (b_diff [+ E_diff / T]) group unconditionally:
+                # the log-pressure interpolation weight below applies
+                # whenever either coefficient differs between the two
+                # bracketing pressures, not only when both do.
+                jline_p += ') * (log(pres)'
+                if p1 != 1.0:
+                    jline_p += ' - {:.16e}'.format(math.log(p1))
+                jline_p += ') / '
+                assert p1 != p2, 'Cannot have equal pressures in PLOG'
+                jline_p += '{:.16e})'.format(math.log(p2) - math.log(p1))
             else:
                 jline_p += ')'
 
