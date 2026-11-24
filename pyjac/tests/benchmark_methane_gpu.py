@@ -6,8 +6,13 @@ Use --prepare-only to exercise mechanism generation and reactor sampling on a CP
 """
 
 import argparse
+import errno
+import hashlib
+import os
+import re
 from pathlib import Path
 import shutil
+import socket
 import subprocess
 import sys
 from time import monotonic
@@ -59,23 +64,78 @@ def build_step(directory, command, label):
     print(f'  finished in {monotonic() - start:.1f} s', flush=True)
 
 
-def build(directory, arch):
+def build(directory, destination, arch):
     sources = ['jacob.cu', 'chem_utils.cu', 'spec_rates.cu', 'rxn_rates.cu',
                'rxn_rates_pres_mod.cu', 'gpu_memory.cu']
     for subdir, manifest in [('jacobs', 'jac_list_cuda'), ('rates', 'rate_list_cuda')]:
         names = (directory / subdir / manifest).read_text().split()
         sources.extend(str(Path(subdir) / name) for name in names)
     driver = Path(__file__).with_suffix('.cu').resolve()
-    sources.append(str(driver))
+    sources = [directory / source for source in sources] + [driver]
     flags = ['nvcc', '-O3', '-std=c++14', '-arch=' + arch]
     objects = []
     for i, source in enumerate(sources, start=1):
         obj = f'unit_{i}.o'
-        build_step(directory, flags + ['-dc', '-I.', source, '-o', obj],
-                   f'[{i}/{len(sources)}] {source}')
+        build_step(destination, flags + ['-dc', '-I', str(directory), str(source), '-o', obj],
+                   f'[{i}/{len(sources)}] {source.name}')
         objects.append(obj)
-    build_step(directory, flags + ['-rdc=true', *objects, '-o', 'benchmark'],
+    build_step(destination, flags + ['-rdc=true', *objects, '-o', 'benchmark'],
                'Linking benchmark')
+    for obj in objects:
+        (destination / obj).unlink()
+
+
+def source_key(root):
+    import cantera as ct
+    import numpy as np
+
+    mechanism = next(Path(d) / 'gri30.yaml' for d in ct.get_data_directories()
+                     if (Path(d) / 'gri30.yaml').is_file())
+    digest = hashlib.sha256(f'{ct.__version__}/{np.__version__}'.encode())
+    files = [mechanism, Path(__file__), root / 'pyjac/utils.py']
+    for path in files + sorted((root / 'pyjac/core').glob('*.py')):
+        digest.update(path.read_bytes())
+    return digest.hexdigest()[:20]
+
+
+def binary_key(arch):
+    driver = Path(__file__).with_suffix('.cu').resolve()
+    digest = hashlib.sha256(driver.read_bytes())
+    digest.update(arch.encode())
+    digest.update(subprocess.check_output(['nvcc', '--version']))
+    if arch == 'native':
+        # nvcc's dry run resolves native to the architectures of visible GPUs.
+        plan = subprocess.check_output(['nvcc', '--dryrun', '-arch=native', '-dc', str(driver)],
+                                       stderr=subprocess.STDOUT)
+        targets = sorted(set(re.findall(rb'(?:sm|compute)_[0-9]+[a-z]?', plan)))
+        if targets:
+            digest.update(b' '.join(targets))
+        else:
+            # Some nvcc releases leave "native" unexpanded in dry-run output.
+            digest.update(socket.gethostname().encode())
+            digest.update(os.environ.get('CUDA_VISIBLE_DEVICES', '').encode())
+            if shutil.which('nvidia-smi'):
+                devices = subprocess.run(['nvidia-smi', '-L'], capture_output=True)
+                digest.update(devices.stdout)
+    return digest.hexdigest()[:20]
+
+
+def cached_directory(path, create):
+    if path.is_dir():
+        print(f'Reusing {path}', flush=True)
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Publish only a completed directory, including after concurrent first runs.
+    with TemporaryDirectory(dir=path.parent) as tmp:
+        staging = Path(tmp) / 'build'
+        staging.mkdir()
+        create(staging)
+        try:
+            staging.rename(path)
+        except OSError as exc:
+            if exc.errno not in (errno.EEXIST, errno.ENOTEMPTY) or not path.is_dir():
+                raise
+    print(f'Cached {path}', flush=True)
 
 
 def main():
@@ -96,15 +156,15 @@ def main():
         parser.error('batch or thread count exceeds CUDA kernel indexing limits')
     root = Path(__file__).resolve().parents[2]
     sys.path.insert(0, str(root))
-    with TemporaryDirectory(prefix='pyjac-methane-') as tmp:
-        directory = Path(tmp)
-        prepare(directory)
-        if args.prepare_only:
-            return
-        build(directory, args.arch)
-        for systems in args.systems:
-            subprocess.run([str(directory / 'benchmark'), str(systems), str(args.repeats),
-                            str(args.iterations), *map(str, args.threads)], cwd=tmp, check=True)
+    directory = root / 'out' / 'methane_gpu' / source_key(root)
+    cached_directory(directory, prepare)
+    if args.prepare_only:
+        return
+    binary = directory / binary_key(args.arch)
+    cached_directory(binary, lambda dest: build(directory, dest, args.arch))
+    for systems in args.systems:
+        subprocess.run([str(binary / 'benchmark'), str(systems), str(args.repeats),
+                        str(args.iterations), *map(str, args.threads)], cwd=directory, check=True)
 
 
 if __name__ == '__main__':
