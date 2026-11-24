@@ -22,7 +22,8 @@ def main(args=None):
                     build_path=args.build_path,
                     skip_jac=args.skip_jac,
                     last_spec=args.last_species,
-                    auto_diff=args.auto_diff
+                    auto_diff=args.auto_diff,
+                    cuda_block=args.cuda_block
                     )
 
 if __name__ == '__main__':

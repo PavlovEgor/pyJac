@@ -424,6 +424,8 @@ def get_parser():
                         action='store_true',
                         help='Use this option to generate file for use with the '
                              'Adept autodifferentiation library.')
+    parser.add_argument('--cuda-block', action='store_true',
+                        help='Also generate a collective CONP device function for one system per CUDA block.')
     parser.add_argument('-sj', '--skip_jac',
                         required=False,
                         default=False,

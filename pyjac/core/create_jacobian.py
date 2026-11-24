@@ -17,6 +17,7 @@ from . import chem_utilities as chem
 from . import mech_interpret as mech
 from . import rate_subs as rate
 from . import mech_auxiliary as aux
+from . import block_jacobian
 from . import CUDAParams
 from . import CParams
 from . import cache_optimizer as cache
@@ -2220,42 +2221,7 @@ def write_dy_intros(path, lang, number, have_jnplus_jplus):
     return file
 
 
-def write_jacobian(path, lang, specs, reacs, seen_sp, smm=None):
-    """Write Jacobian subroutine in desired language.
-
-    Parameters
-    ----------
-    path : str
-        Path to build directory for file.
-    lang : str {'c', 'cuda', 'fortran', 'matlab'}
-        Programming language.
-    specs : list of SpecInfo
-        List of species in the mechanism.
-    reacs : list of ReacInfo
-        List of reactions in the mechanism.
-    seen_sp : list of bool
-        List of `bool`; ``False`` if species has (identically) zero rate
-    smm : shared_memory_manager, optional
-        If not ``None``, use this to manage shared memory optimization
-
-    Returns
-    -------
-    None
-
-    """
-
-    if lang == 'cuda':
-        do_unroll = len(reacs) > CUDAParams.Jacob_Unroll
-        unroll_len = CUDAParams.Jacob_Unroll
-        limit = CUDAParams.Max_Lines
-    elif lang == 'c':
-        do_unroll = len(reacs) > CParams.Jacob_Unroll
-        unroll_len = CParams.Jacob_Unroll
-        limit = CParams.Max_Lines
-    if do_unroll:
-        # make paths for separate jacobian files
-        utils.create_dir(os.path.join(path, 'jacobs'))
-
+def write_jacobian_header(path, lang, do_unroll):
     # first write header file
     file = open(os.path.join(path, 'jacob' + utils.header_ext[lang]), 'w')
     file.write('#ifndef JACOB_HEAD\n'
@@ -2281,25 +2247,11 @@ def write_jacobian(path, lang, specs, reacs, seen_sp, smm=None):
                )
     file.close()
 
-    # numbers of species and reactions
-    num_s = len(specs)
+
+def write_conp_start(path, lang, smm, num_s, reacs, rev_reacs, pdep_reacs, cuda_cheb):
     num_r = len(reacs)
-    rev_reacs = [i for i, rxn in enumerate(reacs) if rxn.rev]
     num_rev = len(rev_reacs)
-
-    pdep_reacs = []
-    for i, reac in enumerate(reacs):
-        if reac.thd_body or reac.pdep:
-            # add reaction index to list
-            pdep_reacs.append(i)
     num_pdep = len(pdep_reacs)
-
-    # reaction index -> position within rev_reacs/pdep_reacs, so repeated
-    # lookups below don't rescan these lists for every reaction
-    rev_reacs_pos = {ind: pos for pos, ind in enumerate(rev_reacs)}
-    pdep_reacs_pos = {ind: pos for pos, ind in enumerate(pdep_reacs)}
-
-    # create file depending on language
     filename = 'jacob' + utils.file_ext[lang]
     file = open(os.path.join(path, filename), 'w')
 
@@ -2397,17 +2349,10 @@ def write_jacobian(path, lang, specs, reacs, seen_sp, smm=None):
                '\n'
                )
 
-    rate_list = ['fwd_rates']
-    if len(rev_reacs):
-        rate_list.append('rev_rates')
-    if len(pdep_reacs):
-        rate_list.append('pres_mod')
-    rate_list.append('spec_rates')
     file.write(utils.line_start + utils.comment[lang] +
                ' evaluate reaction rates\n'
                )
 
-    cuda_cheb = any(rxn.cheb for rxn in reacs) and lang == 'cuda'
     # evaluate forward and reverse reaction rates
     if lang in ['c', 'cuda']:
         if lang == 'cuda':
@@ -2521,6 +2466,161 @@ def write_jacobian(path, lang, specs, reacs, seen_sp, smm=None):
                    'rev_rates, pres_mod);\n'
                    )
     file.write('\n')
+
+    return file, get_array
+
+
+def write_thermo_arrays(file, lang, specs, get_array):
+    num_s = len(specs)
+    # evaluate enthalpy
+    if lang == 'c':
+        file.write('  // species enthalpies\n'
+                   '  double h[{}];\n'.format(num_s) +
+                   '  eval_h(T, h);\n')
+    elif lang == 'cuda':
+        file.write('  // species enthalpies\n'
+                   '  double * {} h = d_mem->h;\n'.format(
+                        utils.restrict[lang]) +
+                   '  eval_h(T, h);\n')
+    elif lang == 'fortran':
+        file.write('  ! species enthalpies\n'
+                   '  call eval_h(T, h)\n'
+                   )
+    elif lang == 'matlab':
+        file.write('  % species enthalpies\n'
+                   '  h = eval_h(T);\n'
+                   )
+    file.write('\n')
+
+    # evaluate specific heat
+    if lang == 'c':
+        file.write('  // species specific heats\n'
+                   '  double cp[{}];\n'.format(num_s) +
+                   '  eval_cp(T, cp);\n')
+    elif lang == 'cuda':
+        file.write('  // species specific heats\n'
+                   '  double * {} cp = d_mem->cp;\n'.format(
+                        utils.restrict[lang]) +
+                   '  eval_cp(T, cp);\n')
+    elif lang == 'fortran':
+        file.write('  ! species specific heats\n'
+                   '  call eval_cp(T, cp)\n'
+                   )
+    elif lang == 'matlab':
+        file.write('  % species specific heats\n'
+                   '  cp = eval_cp(T);\n'
+                   )
+    file.write('\n')
+
+    # average specific heat
+    if lang == 'c':
+        file.write('  // average specific heat\n'
+                   '  double cp_avg;\n'
+                   )
+    elif lang == 'cuda':
+        file.write('  // average specific heat\n'
+                   '  register double cp_avg;\n'
+                   )
+    elif lang == 'fortran':
+        file.write('  ! average specific heat\n')
+    elif lang == 'matlab':
+        file.write('  % average specific heat\n')
+
+    line = utils.line_start + 'cp_avg = '
+    for isp, sp in enumerate(specs[:-1]):
+        if len(line) > 70:
+            if lang in ['c', 'cuda']:
+                line += '\n'
+            elif lang == 'fortran':
+                line += ' &\n'
+            elif lang == 'matlab':
+                line += ' ...\n'
+            file.write(line)
+            line = utils.line_start + '   '
+
+        line += ('(' + get_array(lang, 'y', isp + 1) +
+                 ' * ' + get_array(lang, 'cp', isp) + ')'
+                 ' + '
+                 )
+
+    line += ('(' + 'y_N' + ' * ' +
+             get_array(lang, 'cp', len(specs) - 1) + ')'
+             )
+    line += utils.line_end[lang]
+    file.write(line)
+
+
+def write_jacobian(path, lang, specs, reacs, seen_sp, smm=None, block=False):
+    """Write Jacobian subroutine in desired language.
+
+    Parameters
+    ----------
+    path : str
+        Path to build directory for file.
+    lang : str {'c', 'cuda', 'fortran', 'matlab'}
+        Programming language.
+    specs : list of SpecInfo
+        List of species in the mechanism.
+    reacs : list of ReacInfo
+        List of reactions in the mechanism.
+    seen_sp : list of bool
+        List of `bool`; ``False`` if species has (identically) zero rate
+    smm : shared_memory_manager, optional
+        If not ``None``, use this to manage shared memory optimization
+
+    Returns
+    -------
+    None
+
+    """
+
+    if lang == 'cuda':
+        do_unroll = len(reacs) > CUDAParams.Jacob_Unroll
+        unroll_len = CUDAParams.Jacob_Unroll
+        limit = CUDAParams.Max_Lines
+    elif lang == 'c':
+        do_unroll = not block and len(reacs) > CParams.Jacob_Unroll
+        unroll_len = CParams.Jacob_Unroll
+        limit = CParams.Max_Lines
+    if do_unroll:
+        # make paths for separate jacobian files
+        utils.create_dir(os.path.join(path, 'jacobs'))
+
+    if not block:
+        write_jacobian_header(path, lang, do_unroll)
+
+    # numbers of species and reactions
+    num_s = len(specs)
+    num_r = len(reacs)
+    rev_reacs = [i for i, rxn in enumerate(reacs) if rxn.rev]
+    num_rev = len(rev_reacs)
+
+    pdep_reacs = []
+    for i, reac in enumerate(reacs):
+        if reac.thd_body or reac.pdep:
+            # add reaction index to list
+            pdep_reacs.append(i)
+    num_pdep = len(pdep_reacs)
+
+    # reaction index -> position within rev_reacs/pdep_reacs, so repeated
+    # lookups below don't rescan these lists for every reaction
+    rev_reacs_pos = {ind: pos for pos, ind in enumerate(rev_reacs)}
+    pdep_reacs_pos = {ind: pos for pos, ind in enumerate(pdep_reacs)}
+
+    rate_list = ['fwd_rates']
+    if len(rev_reacs):
+        rate_list.append('rev_rates')
+    if len(pdep_reacs):
+        rate_list.append('pres_mod')
+    rate_list.append('spec_rates')
+    cuda_cheb = any(rxn.cheb for rxn in reacs) and lang == 'cuda'
+    if block:
+        file = open(os.path.join(path, 'columns.inc'), 'w')
+        block_jacobian.write_state(file, num_rev, num_pdep)
+        get_array = utils.get_array
+    else:
+        file, get_array = write_conp_start(path, lang, smm, num_s, reacs,
+                                           rev_reacs, pdep_reacs, cuda_cheb)
 
     # third-body variable needed for reactions
     if any((rxn.pdep and rxn.pdep_sp is None) or rxn.thd_body for rxn in reacs):
@@ -2841,6 +2941,8 @@ def write_jacobian(path, lang, specs, reacs, seen_sp, smm=None):
                     doT = False
 
             if doT:
+                if block:
+                    file.write('  if (threadIdx.x == 0) {\n')
                 for k_sp in set(rxn.reac + rxn.prod):
                     sp_k = specs[k_sp]
                     line = utils.line_start
@@ -2852,10 +2954,12 @@ def write_jacobian(path, lang, specs, reacs, seen_sp, smm=None):
                                  if k_sp + 1 == num_s
                                  else get_array(lang, 'jac', k_sp + 1)
                                  )
+                        already_set = (J_nplusone_touched if k_sp + 1 == num_s
+                                       else touched[k_sp + 1])
                         line += (
                             j_str +
                             ' {}= {}j_temp{} * {:.16e}'.format(
-                                '+' if touched[k_sp + 1] else '',
+                                '+' if already_set else '',
                                 '' if nu == 1 else ('-' if nu == -1 else ''),
                                 ' * {}'.format(float(nu))
                                 if nu != 1 and nu != -1 else '',
@@ -2884,6 +2988,8 @@ def write_jacobian(path, lang, specs, reacs, seen_sp, smm=None):
                     else:
                         touched[k_sp + 1] = True
 
+                if block:
+                    file.write('  }\n')
                 file.write('\n')
 
             ######################################
@@ -2905,6 +3011,8 @@ def write_jacobian(path, lang, specs, reacs, seen_sp, smm=None):
 
             # now loop through each species
             for j_sp, sp_j in enumerate(specs[:-1]):
+                if block:
+                    block_jacobian.begin_column(file, j_sp + 1)
                 dr_dyj = write_dr_dy_species(lang, specs, rxn, pres_rxn_ind,
                                                         j_sp, sp_j, rxn_ind,
                                                         rev_reacs, get_array
@@ -2976,6 +3084,8 @@ def write_jacobian(path, lang, specs, reacs, seen_sp, smm=None):
 
                     file.write(jline)
                     jline = ''
+                if block:
+                    file.write('  }\n')
 
             file.write('\n')
 
@@ -3022,84 +3132,8 @@ def write_jacobian(path, lang, specs, reacs, seen_sp, smm=None):
     # Partial derivatives of temperature (energy equation)
     ###################################
 
-    # evaluate enthalpy
-    if lang == 'c':
-        file.write('  // species enthalpies\n'
-                   '  double h[{}];\n'.format(num_s) +
-                   '  eval_h(T, h);\n')
-    elif lang == 'cuda':
-        file.write('  // species enthalpies\n'
-                   '  double * {} h = d_mem->h;\n'.format(
-                        utils.restrict[lang]) +
-                   '  eval_h(T, h);\n')
-    elif lang == 'fortran':
-        file.write('  ! species enthalpies\n'
-                   '  call eval_h(T, h)\n'
-                   )
-    elif lang == 'matlab':
-        file.write('  % species enthalpies\n'
-                   '  h = eval_h(T);\n'
-                   )
-    file.write('\n')
-
-    # evaluate specific heat
-    if lang == 'c':
-        file.write('  // species specific heats\n'
-                   '  double cp[{}];\n'.format(num_s) +
-                   '  eval_cp(T, cp);\n')
-    elif lang == 'cuda':
-        file.write('  // species specific heats\n'
-                   '  double * {} cp = d_mem->cp;\n'.format(
-                        utils.restrict[lang]) +
-                   '  eval_cp(T, cp);\n')
-    elif lang == 'fortran':
-        file.write('  ! species specific heats\n'
-                   '  call eval_cp(T, cp)\n'
-                   )
-    elif lang == 'matlab':
-        file.write('  % species specific heats\n'
-                   '  cp = eval_cp(T);\n'
-                   )
-    file.write('\n')
-
-    # average specific heat
-    if lang == 'c':
-        file.write('  // average specific heat\n'
-                   '  double cp_avg;\n'
-                   )
-    elif lang == 'cuda':
-        file.write('  // average specific heat\n'
-                   '  register double cp_avg;\n'
-                   )
-    elif lang == 'fortran':
-        file.write('  ! average specific heat\n')
-    elif lang == 'matlab':
-        file.write('  % average specific heat\n')
-
-    line = utils.line_start + 'cp_avg = '
-    isfirst = True
-    for isp, sp in enumerate(specs[:-1]):
-        if len(line) > 70:
-            if lang in ['c', 'cuda']:
-                line += '\n'
-            elif lang == 'fortran':
-                line += ' &\n'
-            elif lang == 'matlab':
-                line += ' ...\n'
-            file.write(line)
-            line = utils.line_start + '   '
-
-        line += ('(' + get_array(lang, 'y', isp + 1) +
-                 ' * ' + get_array(lang, 'cp', isp) + ')'
-                 ' + '
-                 )
-
-        isfirst = False
-    line += ('(' + 'y_N' + ' * ' +
-             get_array(lang, 'cp', len(specs) - 1) + ')'
-             )
-    line += utils.line_end[lang]
-    file.write(line)
+    if not block:
+        write_thermo_arrays(file, lang, specs, get_array)
 
     # set jac[0] = 0
     # set to zero
@@ -3112,7 +3146,8 @@ def write_jacobian(path, lang, specs, reacs, seen_sp, smm=None):
         line += get_array(lang, 'jac', 0, twod=0) + ' = 0.0'
     touched[0] = True
     line += utils.line_end[lang]
-    file.write(line)
+    if not block:
+        file.write(line)
 
     if not do_unroll:
         line = utils.line_start
@@ -3167,6 +3202,8 @@ def write_jacobian(path, lang, specs, reacs, seen_sp, smm=None):
                 if j_sp + 1 == num_s:
                     continue
 
+                if block:
+                    block_jacobian.begin_column(file, j_sp + 1)
                 if k_sp + 1 < num_s and touched[lin_index]:
                     #still in the actual jacobian
                     #and this combo matters
@@ -3273,6 +3310,8 @@ def write_jacobian(path, lang, specs, reacs, seen_sp, smm=None):
                 line += get_array(lang, 'h', k_sp) + ' * (' + jac_part + sp_part + ')' + utils.line_end[lang]
                 if jac_part != '-' or seen_sp[k_sp]:
                     file.write(line)
+                if block:
+                    file.write('  }\n')
 
             if do_unroll and k_sp == next_fn_index - 1:
                 # switch back
@@ -3297,6 +3336,8 @@ def write_jacobian(path, lang, specs, reacs, seen_sp, smm=None):
     ######################################
     # Derivatives with respect to temperature
     ######################################
+    if block:
+        file.write('  if (threadIdx.x == 0) {\n')
     write_dcp_dt(file, lang, specs)
 
     ######################################
@@ -3307,6 +3348,11 @@ def write_jacobian(path, lang, specs, reacs, seen_sp, smm=None):
 
     # finish the dT entry
     write_dt_completion(file, lang, specs, J_nplusone_touched, get_array, conp=True)
+
+    if block:
+        file.write('  }\n  }\n  __syncthreads();\n}\n')
+        file.close()
+        return touched
 
     if lang in ['c', 'cuda']:
         file.write('} // end eval_jacob\n\n')
@@ -3743,7 +3789,7 @@ def create_jacobian(lang, mech_name=None, therm_name=None, gas=None, optimize_ca
                     initial_state="", num_blocks=8, num_threads=64,
                     no_shared=False, L1_preferred=True, multi_thread=None,
                     force_optimize=False, build_path='./out/', last_spec=None,
-                    skip_jac=False, auto_diff=False, conp=True
+                    skip_jac=False, auto_diff=False, conp=True, cuda_block=False
                     ):
     """Create Jacobian subroutine from mechanism.
 
@@ -3789,12 +3835,17 @@ def create_jacobian(lang, mech_name=None, therm_name=None, gas=None, optimize_ca
     conp : bool, optional
         If ``True`` (default), generate constant-pressure Jacobian;
         if ``False``, generate constant-volume Jacobian.
+    cuda_block : bool, optional
+        Also emit the cooperative device function for one system per block.
 
     Returns
     -------
     None
 
     """
+    if cuda_block and (lang.lower() != 'cuda' or not conp or skip_jac or auto_diff):
+        raise ValueError('cuda_block requires a CUDA analytical Jacobian at constant pressure')
+
     if lang != 'c' and auto_diff:
         print('Error: autodifferention only supported for C')
         sys.exit(2)
@@ -3974,6 +4025,11 @@ def create_jacobian(lang, mech_name=None, therm_name=None, gas=None, optimize_ca
         touched = write_jacobian(build_path, lang, specs,
                                          reacs, seen_sp, smm)
 
+        if cuda_block:
+            block_path = block_jacobian.write_helpers(
+                build_path, specs, reacs, fwd_spec_mapping, fwd_rxn_mapping)
+            write_jacobian(block_path, 'c', specs, reacs, seen_sp, block=True)
+
         write_sparse_multiplier(build_path, lang, touched, len(specs))
 
     return 0
@@ -3995,5 +4051,7 @@ if __name__ == "__main__":
                     force_optimize=args.force_optimize,
                     build_path=args.build_path,
                     last_spec=args.last_species,
-                    auto_diff=args.auto_diff
+                    auto_diff=args.auto_diff,
+                    cuda_block=args.cuda_block,
+                    skip_jac=args.skip_jac
                     )

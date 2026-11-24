@@ -253,3 +253,35 @@ if we have 1000 states to evaluate:
 
 Note that this uses the ordering discussed in (:ref:`data_passing`), while the
 Jacobian values are explained in (:ref:`jac_vals`).
+
+One CUDA block per system
+-------------------------
+
+For a constant-pressure solver, generate the cooperative device function alongside
+the scalar Jacobian. For example::
+
+    python3 -m pyjac -l cuda -i data/h2o2.inp --cuda-block -b out
+
+Include ``jacob_block.cuh`` in the solver and device-link the generated Jacobian
+as usual. Launch a one-dimensional grid with one one-dimensional block per system.
+Pass the same pressure (Pa), contiguous state, matrix and workspace to every
+thread in a block. The state contains temperature followed by the first
+``NSP - 1`` mass fractions in generated mechanism order.
+
+.. code-block:: cuda
+
+    #include "jacob_block.cuh"
+
+    __global__ void solve(const double* pressure, const double* states) {
+        const size_t system = blockIdx.x;
+        __shared__ jacob_block_workspace work;
+        __shared__ double J[NSP * NSP];
+        eval_jacob_block(pressure[system], states + system * NSP, J, work);
+        // All columns are ready. The solver can factor J in place here.
+    }
+
+The matrix uses ``J[row + NSP * column]``. Thread ``column % blockDim.x``
+assembles each column. All threads must participate in the call and its barriers.
+The example needs ``sizeof(jacob_block_workspace) + NSP * NSP * sizeof(double)``
+bytes of shared memory per block in addition to the solver's own storage.
+The caller can also supply per-system device-memory buffers for either argument.

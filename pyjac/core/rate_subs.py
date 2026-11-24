@@ -252,7 +252,7 @@ def get_cheb_rate(lang, rxn, write_defns=True):
 
 
 def write_rxn_rates(path, lang, specs, reacs, fwd_rxn_mapping,
-                    smm=None, auto_diff=False):
+                    smm=None, auto_diff=False, device=False):
     """Write reaction rate subroutine.
 
     Includes conditionals for reversible reactions.
@@ -286,7 +286,7 @@ def write_rxn_rates(path, lang, specs, reacs, fwd_rxn_mapping,
     num_rev = len(rev_reacs)
     pdep_reacs = [i for i, rxn in enumerate(reacs) if rxn.thd_body or rxn.pdep]
 
-    pre = '__device__ ' if lang == 'cuda' else ''
+    pre = '__device__ ' if lang == 'cuda' or device else ''
     file_prefix = 'ad_' if auto_diff else ''
     pres_ref = '&' if auto_diff else ''
     file = open(os.path.join(path, '{}rates'.format(file_prefix)
@@ -399,7 +399,7 @@ def write_rxn_rates(path, lang, specs, reacs, fwd_rxn_mapping,
 
         pre = '  '
         line = ''
-        if lang == 'cuda': line = '__device__ '
+        if lang == 'cuda' or device: line = '__device__ '
 
         my_reacs = reacs[start:end]
 
@@ -877,8 +877,7 @@ def write_rxn_rates(path, lang, specs, reacs, fwd_rxn_mapping,
 
 
 def write_rxn_pressure_mod(path, lang, specs, reacs,
-                           fwd_rxn_mapping, smm=None, auto_diff=False
-                           ):
+                           fwd_rxn_mapping, smm=None, auto_diff=False, device=False):
     """Write subroutine to for reaction pressure dependence modifications.
 
     Parameters
@@ -946,7 +945,7 @@ def write_rxn_pressure_mod(path, lang, specs, reacs,
             if reac.sri and not sri_flag: sri_flag = True
 
     line = ''
-    if lang == 'cuda': line = '__device__ '
+    if lang == 'cuda' or device: line = '__device__ '
 
     if lang in ['c', 'cuda']:
         line += ('void get_rxn_pres_mod (const {0} T, const {0}{1} pres, '
@@ -1295,7 +1294,7 @@ def write_rxn_pressure_mod(path, lang, specs, reacs,
 
 
 def write_spec_rates(path, lang, specs, reacs, fwd_spec_mapping,
-                    fwd_rxn_mapping, smm=None, auto_diff=False):
+                    fwd_rxn_mapping, smm=None, auto_diff=False, device=False):
     """Write subroutine to evaluate species rates of production.
 
     Parameters
@@ -1356,7 +1355,7 @@ def write_spec_rates(path, lang, specs, reacs, fwd_spec_mapping,
             pdep_reacs.append(i_rxn)
 
     line = ''
-    if lang == 'cuda': line = '__device__ '
+    if lang == 'cuda' or device: line = '__device__ '
 
     if lang in ['c', 'cuda']:
         line += ('void eval_spec_rates (const {0} * {1} fwd_rates,'
@@ -1542,7 +1541,7 @@ def write_spec_rates(path, lang, specs, reacs, fwd_spec_mapping,
     return seen
 
 
-def write_chem_utils(path, lang, specs, auto_diff):
+def write_chem_utils(path, lang, specs, auto_diff, device=False):
     """Write subroutine to evaluate species thermodynamic properties.
 
     Notes
@@ -1577,7 +1576,7 @@ def write_chem_utils(path, lang, specs, auto_diff):
 
     num_s = len(specs)
 
-    pre = '__device__ ' if lang == 'cuda' else ''
+    pre = '__device__ ' if lang == 'cuda' or device else ''
     file = open(os.path.join(path, file_prefix + 'chem_utils'
                              + utils.header_ext[lang]), 'w')
     file.write('#ifndef CHEM_UTILS_HEAD\n'
