@@ -10,6 +10,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+from time import monotonic
 from tempfile import TemporaryDirectory
 
 
@@ -43,6 +44,40 @@ def prepare(directory):
                     cuda_block=True, build_path=str(directory))
 
 
+def build_step(directory, command, label):
+    print(label, flush=True)
+    start = monotonic()
+    with subprocess.Popen(command, cwd=directory) as process:
+        while True:
+            try:
+                status = process.wait(timeout=30)
+                break
+            except subprocess.TimeoutExpired:
+                print(f'{label} (still running, {monotonic() - start:.0f} s)', flush=True)
+    if status:
+        raise subprocess.CalledProcessError(status, command)
+    print(f'  finished in {monotonic() - start:.1f} s', flush=True)
+
+
+def build(directory, arch):
+    sources = ['jacob.cu', 'chem_utils.cu', 'spec_rates.cu', 'rxn_rates.cu',
+               'rxn_rates_pres_mod.cu', 'gpu_memory.cu']
+    for subdir, manifest in [('jacobs', 'jac_list_cuda'), ('rates', 'rate_list_cuda')]:
+        names = (directory / subdir / manifest).read_text().split()
+        sources.extend(str(Path(subdir) / name) for name in names)
+    driver = Path(__file__).with_suffix('.cu').resolve()
+    sources.append(str(driver))
+    flags = ['nvcc', '-O3', '-std=c++14', '-arch=' + arch]
+    objects = []
+    for i, source in enumerate(sources, start=1):
+        obj = f'unit_{i}.o'
+        build_step(directory, flags + ['-dc', '-I.', source, '-o', obj],
+                   f'[{i}/{len(sources)}] {source}')
+        objects.append(obj)
+    build_step(directory, flags + ['-rdc=true', *objects, '-o', 'benchmark'],
+               'Linking benchmark')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -66,19 +101,15 @@ def main():
         prepare(directory)
         if args.prepare_only:
             return
-        sources = ['jacob.cu', 'chem_utils.cu', 'spec_rates.cu', 'rxn_rates.cu',
-                   'rxn_rates_pres_mod.cu', 'gpu_memory.cu']
-        for subdir, manifest in [('jacobs', 'jac_list_cuda'), ('rates', 'rate_list_cuda')]:
-            names = (directory / subdir / manifest).read_text().split()
-            sources.extend(str(Path(subdir) / name) for name in names)
-        driver = Path(__file__).with_suffix('.cu').resolve()
-        print('Compiling the generated Jacobians with nvcc ...', flush=True)
-        subprocess.run(['nvcc', '-O3', '-std=c++14', '-rdc=true', '-arch=' + args.arch,
-                        '-I.', *sources, str(driver), '-o', 'benchmark'], cwd=tmp, check=True)
+        build(directory, args.arch)
         for systems in args.systems:
             subprocess.run([str(directory / 'benchmark'), str(systems), str(args.repeats),
                             str(args.iterations), *map(str, args.threads)], cwd=tmp, check=True)
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print('Benchmark interrupted.', file=sys.stderr)
+        sys.exit(130)

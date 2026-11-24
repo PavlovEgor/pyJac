@@ -56,6 +56,7 @@ __device__ void eval_jacob_block(double pres, const double* y, double* jac,
         file.write('''
 #include "jacob_block.cuh"
 #ifdef CONP
+#include "jacob_block/chunks.cuh"
 namespace pyjac_block {
 #include "jacob_block/chem_utils.c"
 #include "jacob_block/rxn_rates.c"
@@ -73,6 +74,20 @@ __device__ void eval_jacob_block(double pres, const double* y, double* jac,
 #endif
 ''')
     return block_path
+
+
+def write_chunk_list(block_path, count):
+    """Expose separate device functions to the assembler and the library build."""
+    names = ['block_jacob_{}'.format(i) for i in range(count)]
+    with open(os.path.join(block_path, 'chunks.cuh'), 'w') as header:
+        for name in names:
+            header.write('#include "../jacobs/{}.cuh"\n'.format(name))
+    if names:
+        manifest = os.path.join(os.path.dirname(block_path), 'jacobs', 'jac_list_cuda')
+        with open(manifest, 'a') as file:
+            if file.tell():
+                file.write(' ')
+            file.write(' '.join(name + '.cu' for name in names))
 
 
 def write_state(file, num_rev, num_pdep):

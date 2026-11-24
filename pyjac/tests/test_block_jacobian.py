@@ -8,15 +8,19 @@ import subprocess
 import numpy as np
 import pytest
 
+from ..core import CUDAParams
 from ..core.create_jacobian import create_jacobian
 
 
-def test_block_jacobian(tmp_path):
+@pytest.mark.parametrize('split', [False, True])
+def test_block_jacobian(tmp_path, monkeypatch, split):
     if not all(shutil.which(tool) for tool in ('gcc', 'g++')):
         pytest.skip('host block test uses GCC and OpenMP')
 
     mechanism = str(Path(__file__).resolve().parents[2] / 'data/h2o2.inp')
     cpu, gpu = tmp_path / 'cpu', tmp_path / 'gpu'
+    if split:
+        monkeypatch.setattr(CUDAParams, 'Jacob_Spec_Unroll', 8)
     # A reactive dependent species exercises the extra energy-equation terms.
     for lang, path in [('c', cpu), ('cuda', gpu)]:
         create_jacobian(lang, mechanism, build_path=str(path), last_spec='H2O',
@@ -51,10 +55,15 @@ extern "C" __attribute__((visibility("default"))) void evaluate(int threads, dou
     eval_jacob_block(p, y, jac, work);
 }
 ''')
+    chunks = []
+    if split:
+        manifest = gpu / 'jacobs' / 'jac_list_cuda'
+        chunks = [str(manifest.parent / name) for name in manifest.read_text().split()]
+        assert len(chunks) > 1
     subprocess.check_call(['g++', '-std=c++11', '-shared', '-fPIC', '-fopenmp',
                            '-ffunction-sections', '-fvisibility=hidden',
                            '-Wl,--gc-sections', '-I.', '-I' + str(gpu),
-                           'block.cpp', '-o', 'block.so'], cwd=tmp_path)
+                           '-x', 'c++', 'block.cpp', *chunks, '-o', 'block.so'], cwd=tmp_path)
 
     ref = ctypes.CDLL(str(tmp_path / 'ref.so'))
     block = ctypes.CDLL(str(tmp_path / 'block.so')).evaluate

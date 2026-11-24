@@ -1943,7 +1943,7 @@ def write_dt_completion(file, lang, specs, J_nplusone_touched, get_array, conp=T
 def write_sub_intro(path, lang, number, rate_list, this_rev, this_pdep,
                     have_pres_mod_temp,
                     batch_has_m, this_thd, this_troe, this_sri,
-                    this_cheb, cheb_dim, this_plog, no_shared, has_nsp
+                    this_cheb, cheb_dim, this_plog, no_shared, has_nsp, block=False
                     ):
     """
     Writes the header and definitions for the Jacobian reaction update subfiles
@@ -1989,16 +1989,17 @@ def write_sub_intro(path, lang, number, rate_list, this_rev, this_pdep,
         Opened Jacobian file
 
     """
-    with open(os.path.join(path, 'jacob_' + str(number) +
-              utils.header_ext[lang]), 'w'
+    target = 'cuda' if block else lang
+    name = ('block_jacob_' if block else 'jacob_') + str(number)
+    with open(os.path.join(path, name +
+              utils.header_ext[target]), 'w'
               ) as file:
-        file.write('#ifndef JACOB_HEAD_{}\n'.format(number) +
-                   '#define JACOB_HEAD_{}\n'.format(number) +
+        file.write('#ifndef {}_HEAD\n'.format(name.upper()) +
+                   '#define {}_HEAD\n'.format(name.upper()) +
                    '\n'
-                   '#include "header{}"\n'.format(utils.header_ext[lang]) +
-                   '\n' + ('__device__ ' if lang == 'cuda' else '') +
-                   ''
-                   'void eval_jacob_{} ('.format(number)
+                   '#include "header{}"\n'.format(utils.header_ext[target]) +
+                   '\n' + ('__device__ ' if target == 'cuda' else '') +
+                   'void eval_{} ('.format(name)
                    )
         line = 'const double, const double * {0}'
         for rate in rate_list:
@@ -2015,17 +2016,17 @@ def write_sub_intro(path, lang, number, rate_list, this_rev, this_pdep,
                  '#endif\n'
                  )
         file.write(line.format(utils.restrict[lang]))
-    file = open(os.path.join(path, 'jacob_' + str(number) +
-                utils.file_ext[lang]), 'w'
+    file = open(os.path.join(path, name +
+                utils.file_ext[target]), 'w'
                 )
     file.write('#include <math.h>\n'
-               '#include "header{}"\n'.format(utils.header_ext[lang]) +
+               '#include "header{}"\n'.format(utils.header_ext[target]) +
                '\n'
                )
 
-    line =  '__device__ ' if lang == 'cuda' else ''
+    line = '__device__ ' if target == 'cuda' else ''
 
-    line += ('void eval_jacob_{} (const double pres, '.format(number) +
+    line += ('void eval_{} (const double pres, '.format(name) +
              'const double * {0} conc')
     for rate in rate_list:
         line += ', const double * {0} ' + rate
@@ -2150,7 +2151,7 @@ def write_sub_intro(path, lang, number, rate_list, this_rev, this_pdep,
     return file
 
 
-def write_dy_intros(path, lang, number, have_jnplus_jplus):
+def write_dy_intros(path, lang, number, have_jnplus_jplus, block=False):
     """
     Writes the header and definitions for the various Jacobian species update subfiles
 
@@ -2171,16 +2172,18 @@ def write_dy_intros(path, lang, number, have_jnplus_jplus):
         Jacobian file object
 
     """
-    with open(os.path.join(path, 'jacob_' + str(number) +
-              utils.header_ext[lang]), 'w'
+    target = 'cuda' if block else lang
+    name = ('block_jacob_' if block else 'jacob_') + str(number)
+    with open(os.path.join(path, name +
+              utils.header_ext[target]), 'w'
               ) as file:
-        file.write('#ifndef JACOB_HEAD_{}\n'.format(number) +
-                   '#define JACOB_HEAD_{}\n'.format(number) +
+        file.write('#ifndef {}_HEAD\n'.format(name.upper()) +
+                   '#define {}_HEAD\n'.format(name.upper()) +
                    '\n'
-                   '#include "header{}"\n'.format(utils.header_ext[lang]) +
+                   '#include "header{}"\n'.format(utils.header_ext[target]) +
                    '\n' +
-                   ('__device__ ' if lang == 'cuda' else '') +
-                   'void eval_jacob_{} ('.format(number)
+                   ('__device__ ' if target == 'cuda' else '') +
+                   'void eval_{} ('.format(name)
                    )
         file.write('const double, const double, const double, const double*, '
                    'const double*, const double*, double*'
@@ -2189,16 +2192,16 @@ def write_dy_intros(path, lang, number, have_jnplus_jplus):
                    '\n'
                    '#endif\n'
                    )
-    file = open(os.path.join(path, 'jacob_' + str(number) +
-                utils.file_ext[lang]), 'w'
+    file = open(os.path.join(path, name +
+                utils.file_ext[target]), 'w'
                 )
-    file.write('#include "header{}"\n'.format(utils.header_ext[lang]) +
+    file.write('#include "header{}"\n'.format(utils.header_ext[target]) +
                '\n'
                )
 
-    line = '__device__ ' if lang == 'cuda' else ''
+    line = '__device__ ' if target == 'cuda' else ''
 
-    line += ('void eval_jacob_{} '.format(number) +
+    line += ('void eval_{} '.format(name) +
              '(const double mw_avg, const double rho, '
              'const double cp_avg, const double* spec_rates, '
              'const double* h, const double* cp, double* jac' +
@@ -2574,17 +2577,24 @@ def write_jacobian(path, lang, specs, reacs, seen_sp, smm=None, block=False):
 
     """
 
-    if lang == 'cuda':
+    if block:
+        # The cooperative expressions include a column-owner branch per species.
+        # Bound the amount of control flow optimized in one device function.
+        do_unroll = len(reacs) > CUDAParams.Jacob_Unroll or len(specs) > CUDAParams.Jacob_Spec_Unroll
+        unroll_len = 8
+    elif lang == 'cuda':
         do_unroll = len(reacs) > CUDAParams.Jacob_Unroll
         unroll_len = CUDAParams.Jacob_Unroll
         limit = CUDAParams.Max_Lines
     elif lang == 'c':
-        do_unroll = not block and len(reacs) > CParams.Jacob_Unroll
+        do_unroll = len(reacs) > CParams.Jacob_Unroll
         unroll_len = CParams.Jacob_Unroll
         limit = CParams.Max_Lines
+    chunk_dir = os.path.join(os.path.dirname(path) if block else path, 'jacobs')
+    chunk_prefix = 'block_jacob_' if block else 'jacob_'
     if do_unroll:
         # make paths for separate jacobian files
-        utils.create_dir(os.path.join(path, 'jacobs'))
+        utils.create_dir(chunk_dir)
 
     if not block:
         write_jacobian_header(path, lang, do_unroll)
@@ -2846,12 +2856,12 @@ def write_jacobian(path, lang, specs, reacs, seen_sp, smm=None, block=False):
                 if cheb:
                     dim = max(rxn.cheb_n_temp for rxn in reacs if rxn.cheb)
                 # write the specific evaluator for this reaction
-                file = write_sub_intro(os.path.join(path, 'jacobs'), lang,
+                file = write_sub_intro(chunk_dir, lang,
                                        jac_count, rate_list, rev, pdep,
                                        have_pres_mod_temp,
                                        batch_has_m, thd, troe, sri, cheb,
                                        dim, plog, smm is None,
-                                       has_jnplus_one
+                                       has_jnplus_one, block=block
                                        )
 
             if lang == 'cuda' and smm is not None:
@@ -3100,7 +3110,7 @@ def write_jacobian(path, lang, specs, reacs, seen_sp, smm=None, block=False):
                 file = file_store
                 #test file size for CUDA
                 #to avoid killing nvcc
-                if jac_count == 0:
+                if not block and jac_count == 0:
                     with open(os.path.join(path, 'jacobs', 'jacob_{}{}'.format(jac_count,
                                 utils.file_ext[lang]))) as readfile:
                         num_lines = sum(1 for line in readfile)
@@ -3109,7 +3119,7 @@ def write_jacobian(path, lang, specs, reacs, seen_sp, smm=None, block=False):
                         retry = True
                         break
 
-                file.write('  eval_jacob_{}('.format(jac_count))
+                file.write('  eval_{}{}('.format(chunk_prefix, jac_count))
                 jac_count += 1
                 line = ('pres, conc')
                 for rate in rate_list:
@@ -3175,6 +3185,9 @@ def write_jacobian(path, lang, specs, reacs, seen_sp, smm=None, block=False):
     limit = (CParams.Max_Spec_Lines if lang == 'c'
                   else CUDAParams.Max_Spec_Lines)
 
+    if block:
+        unroll_len = 4
+
     touched_copy = touched[:]
     J_nplusjplus_touched_copy = J_nplusjplus_touched[:]
     success = False
@@ -3191,8 +3204,8 @@ def write_jacobian(path, lang, specs, reacs, seen_sp, smm=None, block=False):
                                      and any(J_nplusjplus_touched)
                                      )
 
-                file = write_dy_intros(os.path.join(path, 'jacobs'),
-                                       lang, jac_count, have_jnplus_jplus
+                file = write_dy_intros(chunk_dir, lang, jac_count, have_jnplus_jplus,
+                                       block=block
                                        )
 
             for j_sp, sp_j in enumerate(specs):
@@ -3316,15 +3329,17 @@ def write_jacobian(path, lang, specs, reacs, seen_sp, smm=None, block=False):
             if do_unroll and k_sp == next_fn_index - 1:
                 # switch back
                 file.write('}\n\n')
+                file.close()
                 file = file_store
-                #check that file length is under limit
-                with open(os.path.join(path, 'jacobs', 'jacob_{}{}'.format(jac_count,
-                            utils.file_ext[lang]))) as readfile:
-                    num_lines = sum(1 for line in readfile)
-                if num_lines > limit:
-                    unroll_len = int(unroll_len / 2)
-                    break
-                file.write('  eval_jacob_{}('.format(jac_count))
+                if not block:
+                    #check that file length is under limit
+                    with open(os.path.join(path, 'jacobs', 'jacob_{}{}'.format(jac_count,
+                                utils.file_ext[lang]))) as readfile:
+                        num_lines = sum(1 for line in readfile)
+                    if num_lines > limit:
+                        unroll_len = int(unroll_len / 2)
+                        break
+                file.write('  eval_{}{}('.format(chunk_prefix, jac_count))
                 jac_count += 1
                 line = 'mw_avg, rho, cp_avg, spec_rates, h, cp, jac'
                 if have_jnplus_jplus:
@@ -3352,6 +3367,7 @@ def write_jacobian(path, lang, specs, reacs, seen_sp, smm=None, block=False):
     if block:
         file.write('  }\n  }\n  __syncthreads();\n}\n')
         file.close()
+        block_jacobian.write_chunk_list(path, jac_count if do_unroll else 0)
         return touched
 
     if lang in ['c', 'cuda']:
